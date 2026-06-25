@@ -1,89 +1,61 @@
 #!/bin/bash
-set -uo pipefail
+# transcode-720p.sh: 通用视频转码工具
+# 用法: transcode-720p.sh <input.mp4> [output.mp4]
+# 行为: 短边缩到 720p，保留原始横纵比，h264_videotoolbox -b:v 1500k，音频 -c copy
+# 失败: 保留 .partial 便于诊断，非 0 退出
 
-# 公共视频转码工具：保留原始比例，短边缩到 720
-# 支持横屏（1280×720）和竖屏（720×1280），自动识别
-#
-# 用法：
-#   tools/transcode-720p.sh <input.mp4> [output.mp4]
-#   tools/transcode-720p.sh ~/Videos/锅师小课/xxx.mp4
-#   tools/transcode-720p.sh ~/Videos/锅师小课/xxx.mp4 ~/Videos/锅师小课-720p/xxx_720p.mp4
-#
-# 输出：
-#   - 不指定输出：同目录 <stem>-720p.mp4
-#   - 指定输出：按指定路径
-#
-# 依赖：
-#   - ffmpeg（brew install ffmpeg）
-#   - Apple Silicon Mac（h264_videotoolbox 硬件加速）
+set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-  echo "用法: $0 <input.mp4> [output.mp4]" >&2
+if [[ $# -lt 1 ]] || [[ $# -gt 2 ]]; then
+  echo "usage: $0 <input.mp4> [output.mp4]" >&2
   exit 64
 fi
 
-IN="$1"
-[[ -f "$IN" ]] || { echo "❌ 找不到文件: $IN" >&2; exit 66; }
+INPUT="$1"
 
-DIR="$(dirname "$IN")"
-STEM="$(basename "$IN" .mp4)"
-EXT="${IN##*.}"
+[[ -f "${INPUT}" ]] || { echo "❌ input not found: ${INPUT}" >&2; exit 66; }
 
-if [[ $# -ge 2 ]]; then
-  OUT="$2"
+if [[ $# -eq 2 ]]; then
+  OUTPUT="$2"
 else
-  OUT="${DIR}/${STEM}-720p.${EXT}"
+  DIR="$(dirname "${INPUT}")"
+  STEM="$(basename "${INPUT}" .mp4)"
+  OUTPUT="${DIR}/${STEM}-720p.mp4"
 fi
 
-PARTIAL="${OUT}.partial"
+[[ -f "${OUTPUT}" ]] && { echo "⚠️  output already exists: ${OUTPUT}"; exit 0; }
 
-[[ -f "$OUT" ]] && { echo "⚠️  目标已存在: $OUT  跳过" >&2; exit 0; }
+PARTIAL="${OUTPUT}.partial"
 
-echo "=== 输入 ==="
-ffprobe -v error -show_entries stream=width,height,bit_rate \
-  -show_entries format=duration,size,bit_rate \
-  -of default "$IN"
+# 读 input 宽高，决定横屏/竖屏缩放策略
+read_w_h() {
+  ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=s=x:p=0 "$1" 2>/dev/null | head -1
+}
 
-# 自动检测横屏 / 竖屏，短边缩到 720（保留原始比例）
-W=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN")
-H=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN")
-if (( W >= H )); then
-  SCALE_FILTER="scale=-2:720"
-  echo "横屏 (${W}×${H}) → 输出 *×720（高 720，宽自动按比例）"
+DIM=$(read_w_h "${INPUT}")
+W="${DIM%x*}"
+H="${DIM#*x}"
+
+# 默认按横屏处理（scale=-2:720 会让短边为 720）
+# 竖屏视频: scale=720:-2 让宽为 720，高按比例
+# 用 max 函数让 "短边" 为 720
+if [[ "${W}" -ge "${H}" ]]; then
+  SCALE="-vf scale=-2:720"
 else
-  SCALE_FILTER="scale=720:-2"
-  echo "竖屏 (${W}×${H}) → 输出 720×*（宽 720，高自动按比例）"
+  SCALE="-vf scale=720:-2"
 fi
 
-echo ""
-echo "=== 转码 → $OUT ==="
-START=$(date +%s)
-ffmpeg -y -hide_banner -loglevel warning -stats \
-  -i "$IN" \
-  -vf "$SCALE_FILTER" \
+ffmpeg -y -loglevel warning \
+  -i "${INPUT}" \
+  ${SCALE} \
   -c:v h264_videotoolbox -b:v 1500k \
   -c:a copy \
-  -movflags +faststart \
-  -f mp4 "$PARTIAL"
+  -f mp4 \
+  "${PARTIAL}"
 
-mv "$PARTIAL" "$OUT"
-END=$(date +%s)
+[[ -f "${PARTIAL}" ]] || { echo "❌ transcode failed: no partial output" >&2; exit 1; }
 
-echo ""
-echo "=== 输出 ==="
-ffprobe -v error -show_entries stream=width,height,bit_rate \
-  -show_entries format=duration,size,bit_rate \
-  -of default "$OUT"
-
-IN_SIZE=$(stat -f %z "$IN")
-OUT_SIZE=$(stat -f %z "$OUT")
-RATIO=$(echo "scale=1; (1 - $OUT_SIZE / $IN_SIZE) * 100" | bc)
-
-IN_GB=$(echo "scale=2; $IN_SIZE/1024/1024/1024" | bc)
-OUT_GB=$(echo "scale=2; $OUT_SIZE/1024/1024/1024" | bc)
-ELAPSED_MIN=$(echo "scale=1; ($END-$START)/60" | bc)
-
-echo ""
-echo "✅ 转码完成: $((END-START))s"
-echo "   原始: ${IN_GB} GB"
-echo "   720p: ${OUT_GB} GB  (节省 ${RATIO}%)"
+# atomic rename
+mv "${PARTIAL}" "${OUTPUT}"
+echo "[OK] ${OUTPUT} (${W}x${H} → 720p)"
